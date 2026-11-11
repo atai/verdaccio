@@ -1995,6 +1995,69 @@ describe('storage', () => {
       });
     });
 
+    test('parallel mid-download aborts of an uncached uplink tarball do not crash', async () => {
+      const pkgName = 'abort-parallel-tarball';
+      const filename = `${pkgName}-1.0.0.tgz`;
+      const bigBody = Buffer.alloc(512 * 1024, 1);
+      const upstreamManifest = generateRemotePackageMetadata(
+        pkgName,
+        '1.0.0',
+        'https://fake.verdaccio.org'
+      );
+      nock('https://fake.verdaccio.org').persist().get(`/${pkgName}`).reply(200, upstreamManifest);
+      nock('https://fake.verdaccio.org')
+        .persist()
+        .get(`/${pkgName}/-/${filename}`)
+        .delayBody(250)
+        .reply(200, bigBody, {
+          [HEADER_TYPE.CONTENT_LENGTH]: String(bigBody.length),
+        });
+
+      const config = new Config(
+        configExample(
+          {
+            storage: generateRandomStorage(),
+          },
+          './fixtures/config/getTarball-getupstream.yaml',
+          import.meta.dirname
+        )
+      );
+      const storage = new Storage(config, logger);
+      await storage.init(config);
+
+      const uncaught: Error[] = [];
+      const onUncaught = (err: Error) => uncaught.push(err);
+      const onRejection = (err: Error) => uncaught.push(err);
+      process.on('uncaughtException', onUncaught);
+      process.on('unhandledRejection', onRejection);
+      try {
+        const controllers = Array.from({ length: 8 }, () => new AbortController());
+        const streams = await Promise.all(
+          controllers.map((ac) => storage.getTarball(pkgName, filename, { signal: ac.signal }))
+        );
+        // Drain a little so the uplink pipeline is active, then abort all clients.
+        await Promise.all(
+          streams.map(
+            (stream) =>
+              new Promise<void>((resolve) => {
+                stream.once('data', () => resolve());
+                stream.once('error', () => resolve());
+                setTimeout(resolve, 400);
+              })
+          )
+        );
+        for (const ac of controllers) {
+          ac.abort();
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        expect(uncaught).toEqual([]);
+      } finally {
+        process.off('uncaughtException', onUncaught);
+        process.off('unhandledRejection', onRejection);
+        nock.cleanAll();
+      }
+    }, 20000);
+
     test('should not fetch an off-uplink dist.tarball of a locally published package (SSRF)', async () => {
       const pkgName = 'ssrf-local-pkg';
       const filename = `${pkgName}-1.0.0.tgz`;

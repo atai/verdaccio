@@ -81,6 +81,7 @@ export interface IProxy {
     url: string,
     options: Partial<Pick<ISyncUplinksOptions, 'remoteAddress' | 'etag' | 'retry'>> & {
       throwHttpErrors?: boolean;
+      signal?: AbortSignal;
     }
   ): PassThrough;
   getRegistryKeys(): Promise<RegistryKey[] | null>;
@@ -426,6 +427,7 @@ class ProxyStorage implements IProxy {
     url: string,
     overrideOptions: Pick<ISyncUplinksOptions, 'remoteAddress' | 'etag' | 'retry'> & {
       throwHttpErrors?: boolean;
+      signal?: AbortSignal;
     }
   ): any {
     debug('fetching url for %s', url);
@@ -453,6 +455,7 @@ class ProxyStorage implements IProxy {
         // FIXME: this should be taken from construtor as priority
         retry: this.retry ?? options?.retry,
         timeout: this.timeout,
+        signal: overrideOptions.signal,
         ...(typeof overrideOptions.throwHttpErrors === 'boolean'
           ? { throwHttpErrors: overrideOptions.throwHttpErrors }
           : {}),

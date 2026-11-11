@@ -115,6 +115,27 @@ function hasNonNotFoundUplinkError(errors: any[] | undefined): boolean {
   });
 }
 
+/** Client disconnect / AbortSignal / got Request abort — must not become uncaught. */
+function isAbortLikeError(err: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) {
+    return true;
+  }
+  if (!err || typeof err !== 'object') {
+    return false;
+  }
+  const e = err as { name?: string; code?: string; message?: string };
+  if (e.name === 'AbortError' || e.code === 'ABORT_ERR' || e.code === 'ERR_CANCELED') {
+    return true;
+  }
+  return typeof e.message === 'string' && /aborted|abort/i.test(e.message);
+}
+
+function destroyQuietly(stream: { destroyed?: boolean; destroy?: () => void } | null | undefined) {
+  if (stream && !stream.destroyed && typeof stream.destroy === 'function') {
+    stream.destroy();
+  }
+}
+
 class Storage {
   public localStorage: LocalStorage;
   public filters: Filters | null;
@@ -417,6 +438,8 @@ class Storage {
     let expected_length;
     let uplinkStatusError: Error | null = null;
     const passThroughRemoteStream = new PassThrough();
+    // Absorb late got abort errors after the client has already disconnected.
+    passThroughRemoteStream.on('error', () => {});
     const proxy = this.getUpLinkForDistFile(name, filename, distFile, origin);
     if (proxy === null) {
       // off-uplink url on a locally published package: refuse the fetch (SSRF).
@@ -426,7 +449,18 @@ class Storage {
       );
       return passThroughRemoteStream;
     }
-    const remoteStream = proxy.fetchTarball(distFile.url, { throwHttpErrors: false });
+    const remoteStream = proxy.fetchTarball(distFile.url, {
+      throwHttpErrors: false,
+      signal,
+    });
+
+    const emitUplinkError = (err: Error) => {
+      if (passThroughRemoteStream.destroyed || isAbortLikeError(err, signal)) {
+        destroyQuietly(passThroughRemoteStream);
+        return;
+      }
+      passThroughRemoteStream.emit('error', err);
+    };
 
     const readRemoteBody = (): Promise<any> =>
       new Promise((resolve) => {
@@ -453,7 +487,7 @@ class Storage {
           debug('remote stream response 404');
           remoteStream.resume();
           uplinkStatusError = errorUtils.getNotFound(errorUtils.API_ERROR.NOT_FILE_UPLINK);
-          passThroughRemoteStream.emit('error', uplinkStatusError);
+          emitUplinkError(uplinkStatusError);
           return;
         }
 
@@ -461,7 +495,7 @@ class Storage {
           debug('remote stream response 401');
           remoteStream.resume();
           uplinkStatusError = errorUtils.getUnauthorized(errorUtils.API_ERROR.UNAUTHORIZED_ACCESS);
-          passThroughRemoteStream.emit('error', uplinkStatusError);
+          emitUplinkError(uplinkStatusError);
           return;
         }
 
@@ -474,7 +508,7 @@ class Storage {
             body?.message ||
             'tarball not available: forbidden by uplink';
           uplinkStatusError = errorUtils.getForbidden(message);
-          passThroughRemoteStream.emit('error', uplinkStatusError);
+          emitUplinkError(uplinkStatusError);
           return;
         }
 
@@ -484,7 +518,7 @@ class Storage {
           uplinkStatusError = errorUtils.getInternalError(
             `bad uplink status code: ${res.statusCode}`
           );
-          passThroughRemoteStream.emit('error', uplinkStatusError);
+          emitUplinkError(uplinkStatusError);
           return;
         }
 
@@ -514,11 +548,13 @@ class Storage {
             });
           }
         } catch (err: any) {
-          if (uplinkStatusError) {
+          if (uplinkStatusError || isAbortLikeError(err, signal)) {
+            destroyQuietly(passThroughRemoteStream);
+            destroyQuietly(remoteStream);
             return;
           }
           debug('error on pipeline downloading tarball for package %o', name);
-          passThroughRemoteStream.emit('error', err);
+          emitUplinkError(err);
         }
       })
       .on('downloadProgress', (progress) => {
@@ -528,24 +564,22 @@ class Storage {
         }
       })
       .on('end', () => {
-        if (uplinkStatusError) {
+        if (uplinkStatusError || isAbortLikeError(undefined, signal)) {
           return;
         }
         if (expected_length && current_length != expected_length) {
           debug('stream end, but length mismatch %o %o', current_length, expected_length);
-          passThroughRemoteStream.emit(
-            'error',
-            errorUtils.getInternalError(API_ERROR.CONTENT_MISMATCH)
-          );
+          emitUplinkError(errorUtils.getInternalError(API_ERROR.CONTENT_MISMATCH));
         }
         debug('remote stream end');
       })
       .on('error', (err) => {
-        if (uplinkStatusError) {
+        if (uplinkStatusError || isAbortLikeError(err, signal)) {
+          destroyQuietly(passThroughRemoteStream);
           return;
         }
         debug('remote stream error %o', err);
-        passThroughRemoteStream.emit('error', err);
+        emitUplinkError(err);
       });
 
     return passThroughRemoteStream;
@@ -565,6 +599,8 @@ class Storage {
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     let isOpen = false;
     const localTarballStream = new PassThrough();
+    // Late abort errors from nested uplink pipelines must not become uncaught.
+    localTarballStream.on('error', () => {});
     // Both the local fs stream and the uplink stream announce the tarball size
     // via a 'content-length' event, but the API listens on the PassThrough
     // wrapper — re-emit so the HTTP response can carry a Content-Length header.
@@ -572,6 +608,13 @@ class Storage {
       source.on(HEADER_TYPE.CONTENT_LENGTH, (size) => {
         localTarballStream.emit(HEADER_TYPE.CONTENT_LENGTH, size);
       });
+    };
+    const emitLocalTarballError = (err: any) => {
+      if (localTarballStream.destroyed || isAbortLikeError(err, signal)) {
+        destroyQuietly(localTarballStream);
+        return;
+      }
+      localTarballStream.emit('error', err);
     };
     const localStream = await this.getLocalTarball(name, filename, { signal });
     forwardContentLength(localStream);
@@ -598,16 +641,16 @@ class Storage {
               .then(() => {
                 debug('successfully downloaded tarball for package %o filename %o', name, filename);
               })
-              .catch((err) => {
-                localTarballStream.emit('error', err);
+              .catch((pipelineErr) => {
+                emitLocalTarballError(pipelineErr);
               });
           })
-          .catch((err) => {
-            localTarballStream.emit('error', err);
+          .catch((upstreamErr) => {
+            emitLocalTarballError(upstreamErr);
           });
       } else {
         this.logger.error({ err }, 'some error on fatal: @{err.message}');
-        localTarballStream.emit('error', err);
+        emitLocalTarballError(err);
       }
     });
 
