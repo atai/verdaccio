@@ -1995,6 +1995,127 @@ describe('storage', () => {
       });
     });
 
+    test('refreshes uplink metadata within maxage when the tarball version is missing locally', async () => {
+      const pkgName = 'fresh-within-maxage';
+      const filename = `${pkgName}-2.0.0.tgz`;
+      const storageDir = generateRandomStorage();
+      const config = new Config(
+        configExample(
+          {
+            storage: storageDir,
+          },
+          './fixtures/config/getTarball-maxage.yaml',
+          import.meta.dirname
+        )
+      );
+      const storage = new Storage(config, logger);
+      await storage.init(config);
+      await storage.updateManifest(generatePackageMetadata(pkgName, '1.0.0'), {
+        signal: new AbortController().signal,
+        name: pkgName,
+        uplinksLook: false,
+        requestOptions: defaultRequestOptions,
+      });
+
+      // Mark the local packument as freshly synced so maxage would normally skip the uplink.
+      const raw = await storage.getPackageLocalMetadata(pkgName);
+      raw._uplinks = {
+        ver: { etag: '"fresh"', fetched: Date.now() },
+      };
+      await (storage as any).getPrivatePackageStorage(pkgName).savePackage(pkgName, raw);
+
+      const upstreamManifest = generateRemotePackageMetadata(
+        pkgName,
+        '2.0.0',
+        'https://fake.verdaccio.org',
+        ['1.0.0']
+      );
+      const metadataScope = nock('https://fake.verdaccio.org')
+        .get(`/${pkgName}`)
+        .once()
+        .reply(200, upstreamManifest);
+      nock('https://fake.verdaccio.org')
+        .get(`/${pkgName}/-/${filename}`)
+        .replyWithFile(200, path.join(import.meta.dirname, 'fixtures/tarball.tgz'), {
+          [HEADER_TYPE.CONTENT_LENGTH]: '277',
+        });
+
+      const stream = await storage.getTarball(pkgName, filename, {
+        signal: new AbortController().signal,
+      });
+      await new Promise<void>((resolve, reject) => {
+        stream.on('data', () => undefined);
+        stream.on('end', () => resolve());
+        stream.on('error', reject);
+      });
+      expect(metadataScope.isDone()).toBe(true);
+    });
+
+    test('dedupes concurrent forced metadata refreshes on tarball miss', async () => {
+      const pkgName = 'dedupe-refresh';
+      const filename = `${pkgName}-2.0.0.tgz`;
+      const storageDir = generateRandomStorage();
+      const config = new Config(
+        configExample(
+          {
+            storage: storageDir,
+          },
+          './fixtures/config/getTarball-maxage.yaml',
+          import.meta.dirname
+        )
+      );
+      const storage = new Storage(config, logger);
+      await storage.init(config);
+      await storage.updateManifest(generatePackageMetadata(pkgName, '1.0.0'), {
+        signal: new AbortController().signal,
+        name: pkgName,
+        uplinksLook: false,
+        requestOptions: defaultRequestOptions,
+      });
+      const raw = await storage.getPackageLocalMetadata(pkgName);
+      raw._uplinks = { ver: { etag: '"fresh"', fetched: Date.now() } };
+      await (storage as any).getPrivatePackageStorage(pkgName).savePackage(pkgName, raw);
+
+      const upstreamManifest = generateRemotePackageMetadata(
+        pkgName,
+        '2.0.0',
+        'https://fake.verdaccio.org',
+        ['1.0.0']
+      );
+      let metadataHits = 0;
+      nock('https://fake.verdaccio.org')
+        .get(`/${pkgName}`)
+        .times(1)
+        .delay(150)
+        .reply(200, () => {
+          metadataHits += 1;
+          return upstreamManifest;
+        });
+      nock('https://fake.verdaccio.org')
+        .get(`/${pkgName}/-/${filename}`)
+        .times(4)
+        .replyWithFile(200, path.join(import.meta.dirname, 'fixtures/tarball.tgz'), {
+          [HEADER_TYPE.CONTENT_LENGTH]: '277',
+        });
+
+      const streams = await Promise.all(
+        Array.from({ length: 4 }, () =>
+          storage.getTarball(pkgName, filename, { signal: new AbortController().signal })
+        )
+      );
+      await Promise.all(
+        streams.map(
+          (stream) =>
+            new Promise<void>((resolve, reject) => {
+              stream.on('data', () => undefined);
+              stream.on('end', () => resolve());
+              stream.on('error', reject);
+            })
+        )
+      );
+      expect(metadataHits).toBe(1);
+    });
+
     test('parallel mid-download aborts of an uncached uplink tarball do not crash', async () => {
       const pkgName = 'abort-parallel-tarball';
       const filename = `${pkgName}-1.0.0.tgz`;

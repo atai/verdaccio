@@ -95,6 +95,8 @@ export interface ISyncUplinksOptions extends Options {
   uplinksLook?: boolean;
   etag?: string;
   remoteAddress?: string;
+  /** When true, ignore uplink maxage and contact the remote for fresh metadata. */
+  skipMaxAge?: boolean;
 }
 
 /**

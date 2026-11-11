@@ -146,6 +146,8 @@ class Storage {
   private searchService: Search;
   private stageStorage: StageStorage | null = null;
   private tarballMetadata: TarballMetadataService | null = null;
+  // Coalesce forced packument refreshes for the same name (tarball miss storms).
+  private uplinkRefreshInflight = new Map<string, Promise<[Manifest | null, any]>>();
   public constructor(config: Config, logger: Logger) {
     this.config = config;
     this.logger = logger.child({ module: 'storage' });
@@ -402,12 +404,12 @@ class Storage {
       });
     } else {
       debug('dist file not found, proceed update upstream');
-      // no dist url found, proceed to fetch from upstream
-      // should not be the case
-      // ensure get the latest data
-      const [updatedManifest, uplinkErrors] = await this.syncUplinksMetadata(name, rawManifest, {
-        uplinksLook: true,
-      });
+      // Filename absent from the local packument: force one uplink refresh even
+      // inside maxage so a just-published version is not a false 404.
+      const [updatedManifest, uplinkErrors] = await this.refreshUplinksMetadataForTarball(
+        name,
+        rawManifest
+      );
       const distFile =
         updatedManifest === null ? null : lookupDistFile(updatedManifest as Manifest, filename);
 
@@ -425,6 +427,30 @@ class Storage {
         signal,
       });
     }
+  }
+
+  /** Forced packument sync for tarball misses; one in-flight refresh per package name. */
+  private refreshUplinksMetadataForTarball(
+    name: string,
+    rawManifest: Manifest | null
+  ): Promise<[Manifest | null, any]> {
+    if (!this.uplinkRefreshInflight) {
+      this.uplinkRefreshInflight = new Map();
+    }
+    const inflight = this.uplinkRefreshInflight.get(name);
+    if (inflight) {
+      return inflight;
+    }
+    const pending = this.syncUplinksMetadata(name, rawManifest, {
+      uplinksLook: true,
+      skipMaxAge: true,
+    }).finally(() => {
+      if (this.uplinkRefreshInflight.get(name) === pending) {
+        this.uplinkRefreshInflight.delete(name);
+      }
+    });
+    this.uplinkRefreshInflight.set(name, pending);
+    return pending;
   }
 
   private fetchTarballFromDistFile(
@@ -2308,7 +2334,7 @@ class Storage {
     const upLinkMeta = cachedManifest._uplinks[uplink.uplinkName];
     let _cacheManifest = { ...cachedManifest };
 
-    if (validationUtils.isObject(upLinkMeta)) {
+    if (validationUtils.isObject(upLinkMeta) && options.skipMaxAge !== true) {
       const fetched = upLinkMeta.fetched;
 
       // we check the uplink cache is fresh
