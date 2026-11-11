@@ -13,6 +13,8 @@ import { asyncLoadPlugin } from '@verdaccio/loaders';
 import LocalDatabase from '@verdaccio/local-storage';
 import type { Config, Logger } from '@verdaccio/types';
 
+import { isLegacyStoragePlugin, wrapLegacyStoragePlugin } from './legacy-storage-adapter';
+
 const debug = buildDebug('verdaccio:storage:local');
 
 export const noSuchFile = 'ENOENT';
@@ -72,6 +74,9 @@ class LocalStorage {
         'plugin @{name} successfully loaded (@{pluginCategory})'
       );
       return localStorage;
+    }
+    if (isLegacyStoragePlugin(Storage)) {
+      return wrapLegacyStoragePlugin(Storage, logger) as PluginStorage;
     }
     return Storage as PluginStorage;
   }

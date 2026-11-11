@@ -18,6 +18,7 @@ import {
   DIST_TAGS,
   HEADERS,
   HEADER_TYPE,
+  HTTP_STATUS,
   errorUtils,
   fileUtils,
 } from '@verdaccio/core';
@@ -1921,6 +1922,79 @@ describe('storage', () => {
       });
     });
 
+    test('returns 503 when uplink sync fails and the tarball is not cached locally', async () => {
+      const pkgName = 'offline-tarball';
+      const filename = `${pkgName}-2.0.0.tgz`;
+      const storageDir = generateRandomStorage();
+      nock('https://fake.verdaccio.org').get(`/${pkgName}`).replyWithError({
+        message: 'connect ECONNREFUSED',
+        code: 'ECONNREFUSED',
+      });
+      const config = new Config(
+        configExample(
+          {
+            storage: storageDir,
+          },
+          './fixtures/config/getTarball-getupstream.yaml',
+          import.meta.dirname
+        )
+      );
+      const storage = new Storage(config, logger);
+      await storage.init(config);
+      // stale local packument without the requested version / distfile
+      await storage.updateManifest(generatePackageMetadata(pkgName, '1.0.0'), {
+        signal: new AbortController().signal,
+        name: pkgName,
+        uplinksLook: false,
+        requestOptions: defaultRequestOptions,
+      });
+      const stream = await storage.getTarball(pkgName, filename, {
+        signal: new AbortController().signal,
+      });
+      await expect(
+        new Promise((_, reject) => {
+          stream.on('error', reject);
+          stream.on('data', () => reject(new Error('unexpected data')));
+          stream.on('end', () => reject(new Error('unexpected end')));
+        })
+      ).rejects.toMatchObject({
+        statusCode: HTTP_STATUS.SERVICE_UNAVAILABLE,
+        message: API_ERROR.UPLINK_OFFLINE,
+      });
+    });
+
+    test('keeps 404 when the uplink is reachable and the tarball is absent', async () => {
+      const pkgName = 'missing-remote-tarball';
+      const filename = `${pkgName}-9.9.9.tgz`;
+      nock('https://fake.verdaccio.org')
+        .get(`/${pkgName}`)
+        .reply(200, generateRemotePackageMetadata(pkgName, '1.0.0'));
+      const config = new Config(
+        configExample(
+          {
+            storage: generateRandomStorage(),
+          },
+          './fixtures/config/getTarball-getupstream.yaml',
+          import.meta.dirname
+        )
+      );
+      const storage = new Storage(config, logger);
+      await storage.init(config);
+      const stream = await storage.getTarball(pkgName, filename, {
+        signal: new AbortController().signal,
+      });
+      await expect(
+        new Promise((_, reject) => {
+          stream.on('error', reject);
+          stream.on('data', () => reject(new Error('unexpected data')));
+          stream.on('end', () => reject(new Error('unexpected end')));
+        })
+      ).rejects.toMatchObject({
+        statusCode: HTTP_STATUS.NOT_FOUND,
+        message: API_ERROR.NO_SUCH_FILE,
+      });
+    });
+
     test('should not fetch an off-uplink dist.tarball of a locally published package (SSRF)', async () => {
       const pkgName = 'ssrf-local-pkg';
       const filename = `${pkgName}-1.0.0.tgz`;
@@ -2522,7 +2596,7 @@ describe('storage', () => {
               request: 1000,
             },
           })
-        ).rejects.toThrow(API_ERROR.NO_PACKAGE);
+        ).rejects.toThrow(API_ERROR.UPLINK_OFFLINE);
       }, 18000);
 
       test('should handle one proxy fails', async () => {
@@ -2543,7 +2617,7 @@ describe('storage', () => {
           storage.syncUplinksMetadata(fooManifest.name, null, {
             retry: { limit: 0 },
           })
-        ).rejects.toThrow(API_ERROR.NO_PACKAGE);
+        ).rejects.toThrow(API_ERROR.UPLINK_OFFLINE);
       });
 
       test('should handle one proxy reply 304', async () => {

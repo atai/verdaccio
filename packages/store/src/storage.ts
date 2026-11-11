@@ -97,6 +97,24 @@ export const noSuchFile = 'ENOENT';
 export const resourceNotAvailable = 'EAGAIN';
 export const PROTO_NAME = '__proto__';
 
+/** True when an uplink failed for a reason other than the package/file being absent. */
+function hasNonNotFoundUplinkError(errors: any[] | undefined): boolean {
+  if (!errors?.length) {
+    return false;
+  }
+  return errors.some((err) => {
+    const code = err?.code ?? err?.statusCode ?? err?.status;
+    if (code === HTTP_STATUS.NOT_FOUND) {
+      return false;
+    }
+    const message = err?.message;
+    if (message === API_ERROR.NOT_PACKAGE_UPLINK || message === API_ERROR.NO_PACKAGE) {
+      return false;
+    }
+    return true;
+  });
+}
+
 class Storage {
   public localStorage: LocalStorage;
   public filters: Filters | null;
@@ -366,16 +384,19 @@ class Storage {
       // no dist url found, proceed to fetch from upstream
       // should not be the case
       // ensure get the latest data
-      const [updatedManifest] = await this.syncUplinksMetadata(name, rawManifest, {
+      const [updatedManifest, uplinkErrors] = await this.syncUplinksMetadata(name, rawManifest, {
         uplinksLook: true,
       });
       const distFile =
         updatedManifest === null ? null : lookupDistFile(updatedManifest as Manifest, filename);
 
       if (updatedManifest === null || !distFile) {
+        // Stale local metadata plus a failed uplink sync must not look like a missing file.
+        if (hasNonNotFoundUplinkError(uplinkErrors)) {
+          debug('remote tarball unavailable because uplink sync failed');
+          throw errorUtils.getServiceUnavailable(API_ERROR.UPLINK_OFFLINE);
+        }
         debug('remote tarball not found');
-        // TODO: review the error message, it causes unnecessary
-        // error on console
         throw errorUtils.getNotFound(API_ERROR.NO_SUCH_FILE);
       }
 
@@ -2210,6 +2231,12 @@ class Storage {
           debug('uplinks sync failed with 304 error');
           throw err;
         }
+      }
+      // Offline / network uplink failures must not become a 404: clients retry
+      // forever on "not found" for a version that may exist upstream.
+      if (hasNonNotFoundUplinkError(uplinksErrors)) {
+        debug('uplinks sync failed with unavailable uplink');
+        throw errorUtils.getServiceUnavailable(API_ERROR.UPLINK_OFFLINE);
       }
       debug('uplinks sync failed with no package found');
 

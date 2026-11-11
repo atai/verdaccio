@@ -120,6 +120,7 @@ class ProxyStorage implements IProxy {
   public last_request_time: number | null;
   public strict_ssl: boolean;
   private retry: Partial<RetryOptions>;
+  private hostOffline = false;
 
   public constructor(
     uplinkName: string,
@@ -131,6 +132,7 @@ class ProxyStorage implements IProxy {
     this.uplinkName = uplinkName;
     this.config = config;
     this.failed_requests = 0;
+    this.hostOffline = false;
     this.userAgent = mainConfig.user_agent ?? 'hidden';
     this.ca = config.ca;
     this.logger = logger;
@@ -574,8 +576,10 @@ class ProxyStorage implements IProxy {
           const code = afterResponse.statusCode;
           debug('after response code is %s', code);
           if (code >= HTTP_STATUS.OK && code < HTTP_STATUS.MULTIPLE_CHOICES) {
-            if (this.failed_requests >= this.max_fails) {
-              this.failed_requests = 0;
+            const wasOffline = this.hostOffline || this.failed_requests >= this.max_fails;
+            this.failed_requests = 0;
+            if (wasOffline) {
+              this.hostOffline = false;
               this.logger.warn(
                 {
                   host: this.url.host,
@@ -604,6 +608,7 @@ class ProxyStorage implements IProxy {
             "retry @{retryCount} req: '@{request.method} @{request.url}'"
           );
           if (this.failed_requests >= this.max_fails) {
+            this.hostOffline = true;
             this.logger.warn(
               {
                 host: this.url.host,
@@ -639,16 +644,19 @@ class ProxyStorage implements IProxy {
     return headers;
   }
 
-  /**
-   * If the request failure.
-   * @return {boolean}
-   * @private
-   */
+  // After fail_timeout, reset so concurrent probes are not blocked by last_request_time.
   private _ifRequestFailure(): boolean {
-    return (
-      this.failed_requests >= this.max_fails &&
-      Math.abs(Date.now() - (this.last_request_time as number)) < this.fail_timeout
-    );
+    if (this.failed_requests < this.max_fails) {
+      return false;
+    }
+    if (
+      this.last_request_time === null ||
+      Math.abs(Date.now() - this.last_request_time) >= this.fail_timeout
+    ) {
+      this.failed_requests = 0;
+      return false;
+    }
+    return true;
   }
 
   /**
